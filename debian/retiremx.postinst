@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+if ! getent group retiremx >/dev/null; then
+    addgroup --system retiremx >/dev/null
+fi
+
+if ! id -u retiremx >/dev/null 2>&1; then
+    adduser --system --quiet --ingroup retiremx --home /nonexistent \
+        --no-create-home --shell /usr/sbin/nologin retiremx >/dev/null
+fi
+
+if [ -d /etc/retiremx ]; then
+    chown root:retiremx /etc/retiremx
+    chmod 2770 /etc/retiremx
+fi
+
+if [ -f /etc/retiremx/retiremx.md ]; then
+    chown root:retiremx /etc/retiremx/retiremx.md
+    chmod 0660 /etc/retiremx/retiremx.md
+fi
+
+#DEBHELPER#
+
+exit 0

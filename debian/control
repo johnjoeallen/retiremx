@@ -1,0 +1,16 @@
+Source: retiremx
+Section: mail
+Priority: optional
+Maintainer: John Allen <john@localhost>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/johnjoeallen/retiremx
+
+Package: retiremx
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: SMTP address migration and routing front end
+ retiremx accepts public SMTP connections, rejects retired addresses with
+ useful 550 responses, and proxies explicitly permitted transactions to a
+ local Postfix SMTP service.
