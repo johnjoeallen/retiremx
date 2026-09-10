@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-retiremx}
+      POSTGRES_USER: ${POSTGRES_USER:-retiremx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - retiremx-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-retiremx} -d ${POSTGRES_DB:-retiremx}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  collector:
+    image: retiremx-report:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-retiremx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-retiremx}
+      RETIREMX_LOG_PATH: /logs/events.jsonl
+    volumes:
+      - /var/log/retiremx:/logs:ro
+    group_add:
+      - "${RETIREMX_GID:?set RETIREMX_GID to the host retiremx group ID}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  web:
+    image: retiremx-report:latest
+    restart: unless-stopped
+    # The web process needs to preserve root:retiremx ownership when atomically
+    # replacing the host configuration file.
+    user: "0:${RETIREMX_GID:?set RETIREMX_GID to the host retiremx group ID}"
+    command: ["--mode", "web", "--bind", "0.0.0.0:8080"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-retiremx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-retiremx}
+      RETIREMX_CONFIG_PATH: /retiremx-config/retiremx.md
+    ports:
+      - "127.0.0.1:6873:8080"
+    volumes:
+      - /etc/retiremx:/retiremx-config
+    group_add:
+      - "${RETIREMX_GID:?set RETIREMX_GID to the host retiremx group ID}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  retiremx-postgres:

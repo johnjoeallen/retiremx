@@ -1,0 +1,28 @@
+[Unit]
+Description=retiremx SMTP address migration front end
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=retiremx
+Group=retiremx
+ExecStart=/usr/bin/retiremx --config /etc/retiremx/retiremx.md smtp --event-log /var/log/retiremx/events.jsonl
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=retiremx
+LogsDirectory=retiremx
+LimitNOFILE=4096
+
+# Binding to TCP/25 requires this capability when not running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
