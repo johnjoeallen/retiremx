@@ -49,6 +49,7 @@ struct EventsQuery {
     page: Option<i64>,
     per_page: Option<i64>,
     recipient: Option<String>,
+    unblocked_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +62,7 @@ struct SendersQuery {
     recipient: Option<String>,
     page: Option<i64>,
     per_page: Option<i64>,
+    unblocked_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +217,7 @@ async fn api_events(
         page,
         per_page,
         query.recipient,
+        query.unblocked_only.unwrap_or(false),
     )
     .await
     {
@@ -240,7 +243,14 @@ async fn api_senders(
     };
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(10, 200);
-    match load_senders(state.database_url, recipient, page, per_page).await {
+    match load_senders(
+        state.database_url,
+        recipient,
+        page,
+        per_page,
+        query.unblocked_only.unwrap_or(false),
+    )
+    .await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -410,12 +420,32 @@ async fn load_events(
     page: i64,
     per_page: i64,
     recipient: Option<String>,
+    unblocked_only: bool,
 ) -> Result<EventsResponse> {
     tokio::task::spawn_blocking(move || {
         let mut client =
             postgres::Client::connect(&database_url, NoTls).context("connecting to PostgreSQL")?;
         let hour_start_seconds = hour_start as f64;
         let recipient_filter = recipient.as_deref();
+        let excluded: Vec<String> = if unblocked_only {
+            let senders = client
+                .query(
+                    r#"
+                    SELECT DISTINCT lower(mail_from)
+                    FROM recipient_events
+                    WHERE event_time >= to_timestamp($1::double precision)
+                      AND event_time < to_timestamp(($1 + 3600)::double precision)
+                      AND ($2::text IS NULL OR recipient = $2::text)
+                    "#,
+                    &[&hour_start_seconds, &recipient_filter],
+                )?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            blocked_among(&mut client, senders)?
+        } else {
+            Vec::new()
+        };
         let total: i64 = client
             .query_one(
                 r#"
@@ -424,8 +454,9 @@ async fn load_events(
                 WHERE event_time >= to_timestamp($1::double precision)
                   AND event_time < to_timestamp(($1 + 3600)::double precision)
                   AND ($2::text IS NULL OR recipient = $2::text)
+                  AND NOT (lower(mail_from) = ANY($3::text[]))
                 "#,
-                &[&hour_start_seconds, &recipient_filter],
+                &[&hour_start_seconds, &recipient_filter, &excluded],
             )?
             .get(0);
         let offset = (page - 1) * per_page;
@@ -455,10 +486,17 @@ async fn load_events(
             WHERE event_time >= to_timestamp($1::double precision)
               AND event_time < to_timestamp(($1 + 3600)::double precision)
               AND ($2::text IS NULL OR e.recipient = $2::text)
+              AND NOT (lower(e.mail_from) = ANY($5::text[]))
             ORDER BY e.event_time DESC, e.event_id DESC
             LIMIT $3::bigint OFFSET $4::bigint
             "#,
-            &[&hour_start_seconds, &recipient_filter, &per_page, &offset],
+            &[
+                &hour_start_seconds,
+                &recipient_filter,
+                &per_page,
+                &offset,
+                &excluded,
+            ],
         )?;
         let events = rows
             .iter()
@@ -492,14 +530,32 @@ async fn load_senders(
     recipient: String,
     page: i64,
     per_page: i64,
+    unblocked_only: bool,
 ) -> Result<SendersResponse> {
     tokio::task::spawn_blocking(move || {
         let mut client =
             postgres::Client::connect(&database_url, NoTls).context("connecting to PostgreSQL")?;
+        let excluded: Vec<String> = if unblocked_only {
+            let senders = client
+                .query(
+                    "SELECT DISTINCT lower(mail_from) FROM recipient_events WHERE recipient = $1",
+                    &[&recipient],
+                )?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            blocked_among(&mut client, senders)?
+        } else {
+            Vec::new()
+        };
         let total: i64 = client
             .query_one(
-                "SELECT count(DISTINCT mail_from) FROM recipient_events WHERE recipient = $1",
-                &[&recipient],
+                r#"
+                SELECT count(DISTINCT mail_from)
+                FROM recipient_events
+                WHERE recipient = $1 AND NOT (lower(mail_from) = ANY($2::text[]))
+                "#,
+                &[&recipient, &excluded],
             )?
             .get(0);
         let offset = (page - 1) * per_page;
@@ -507,12 +563,12 @@ async fn load_senders(
             r#"
             SELECT mail_from AS sender, count(*) AS count
             FROM recipient_events
-            WHERE recipient = $1
+            WHERE recipient = $1 AND NOT (lower(mail_from) = ANY($4::text[]))
             GROUP BY mail_from
             ORDER BY count DESC, sender
             LIMIT $2::bigint OFFSET $3::bigint
             "#,
-            &[&recipient, &per_page, &offset],
+            &[&recipient, &per_page, &offset, &excluded],
         )?;
         let senders = rows
             .iter()
@@ -531,6 +587,64 @@ async fn load_senders(
     })
     .await
     .context("waiting for sender query")?
+}
+
+/// Returns the lowercased `candidates` that match any saved blocked-sender rule,
+/// using the same exact/domain/glob/regex semantics as the SMTP service.
+fn blocked_among(client: &mut postgres::Client, candidates: Vec<String>) -> Result<Vec<String>> {
+    let patterns: Vec<String> = client
+        .query("SELECT pattern FROM management_blocked_senders", &[])?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut exact = Vec::new();
+    let mut domains = Vec::new();
+    let mut regexes = Vec::new();
+    for pattern in patterns {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() >= 3 {
+            regexes.push(format!("^(?:{})$", &pattern[1..pattern.len() - 1]));
+        } else if pattern.starts_with('@') && !pattern.contains(['*', '?']) {
+            domains.push(pattern[1..].to_string());
+        } else if pattern.contains(['*', '?']) {
+            let glob = if pattern.starts_with('@') {
+                format!("*{pattern}")
+            } else {
+                pattern
+            };
+            let mut expression = String::from("^");
+            for character in glob.chars() {
+                match character {
+                    '*' => expression.push_str(".*"),
+                    '?' => expression.push('.'),
+                    character => expression.push_str(&regex::escape(&character.to_string())),
+                }
+            }
+            expression.push('$');
+            regexes.push(expression);
+        } else {
+            exact.push(pattern);
+        }
+    }
+    let regexes = regexes
+        .iter()
+        .map(|expression| {
+            regex::RegexBuilder::new(expression)
+                .case_insensitive(true)
+                .build()
+                .with_context(|| format!("invalid blocked sender pattern {expression}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(candidates
+        .into_iter()
+        .filter(|sender| {
+            exact.contains(sender)
+                || sender
+                    .split_once('@')
+                    .is_some_and(|(_, domain)| domains.iter().any(|value| value == domain))
+                || regexes.iter().any(|regex| regex.is_match(sender))
+        })
+        .collect())
 }
 
 async fn load_management(database_url: Arc<str>) -> Result<ManagementSnapshot> {
@@ -797,6 +911,7 @@ fn render_dashboard() -> String {
     .block-domain { color: #fff; background: #2d5d9a; border-color: #5d91d1; }
     .block-domain:hover { background: #3974bb; }
     .tabs { display: flex; gap: .5rem; margin-top: 1rem; }
+    .check { display: inline-flex; align-items: center; gap: .35rem; cursor: pointer; }
     .tab.active { color: #fff; background: #2d5b7d; }
     .manage-link { display: inline-block; margin-top: .8rem; padding: .55rem .8rem; border: 1px solid #4f7ea0; border-radius: 8px; color: #d8efff; background: #21415b; text-decoration: none; font-weight: 650; }
     .manage-link:hover { background: #2d5b7d; }
@@ -824,6 +939,7 @@ fn render_dashboard() -> String {
         <button id="hour-display" type="button" aria-live="polite">Loading…</button>
         <button id="hour-next" type="button" aria-label="Next received hour">→</button>
       </span>
+      <label class="check"><input id="unblocked-only" type="checkbox" checked> Unblocked senders only</label>
       <button id="refresh" type="button">Refresh</button>
       <button id="save-config" type="button" disabled>Save</button>
       <span id="summary" class="summary">Loading…</span>
@@ -856,6 +972,7 @@ fn render_dashboard() -> String {
     const next = document.querySelector('#next');
     const actionNotice = document.querySelector('#action-notice');
     const saveConfigButton = document.querySelector('#save-config');
+    const unblockedOnly = document.querySelector('#unblocked-only');
     const perPage = 50;
     let page = 1;
     let selectedHour = null;
@@ -1093,7 +1210,7 @@ fn render_dashboard() -> String {
 
     async function loadEvents() {
       if (selectedHour === null) { table.textContent = 'No recorded hours.'; summary.textContent = 'No events'; return; }
-      const filter = selectedRecipient ? `&recipient=${encodeURIComponent(selectedRecipient)}` : '';
+      const filter = (selectedRecipient ? `&recipient=${encodeURIComponent(selectedRecipient)}` : '') + (unblockedOnly.checked ? '&unblocked_only=true' : '');
       const response = await fetch(`/api/events?hour_start=${selectedHour}&page=${page}&per_page=${perPage}${filter}`, {cache: 'no-store'});
       if (!response.ok) throw new Error('Unable to load events');
       renderEvents(await response.json());
@@ -1135,7 +1252,7 @@ fn render_dashboard() -> String {
         previous.disabled = true; next.disabled = true;
         return;
       }
-      const response = await fetch(`/api/senders?recipient=${encodeURIComponent(selectedRecipient)}&page=${page}&per_page=${perPage}`, {cache: 'no-store'});
+      const response = await fetch(`/api/senders?recipient=${encodeURIComponent(selectedRecipient)}&page=${page}&per_page=${perPage}${unblockedOnly.checked ? '&unblocked_only=true' : ''}`, {cache: 'no-store'});
       if (!response.ok) throw new Error('Unable to load sender list');
       renderSenders(await response.json());
     }
@@ -1176,6 +1293,7 @@ fn render_dashboard() -> String {
     next.addEventListener('click', () => { page++; activeTab === 'events' ? loadEvents() : loadSenders(); });
     document.querySelector('#refresh').addEventListener('click', refresh);
     saveConfigButton.addEventListener('click', saveConfig);
+    unblockedOnly.addEventListener('change', () => { page = 1; refresh(); });
     refresh();
   </script>
 </body>

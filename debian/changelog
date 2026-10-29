@@ -1,3 +1,9 @@
+retiremx (0.2.0-1) unstable; urgency=medium
+
+  * Add "Unblocked senders only" filter to the reporting dashboard, enabled by default.
+
+ -- John Allen <john@localhost>  Thu, 29 Oct 2026 11:58:15 +0000
+
 retiremx (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian package.
